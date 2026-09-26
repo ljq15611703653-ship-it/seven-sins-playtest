@@ -38,7 +38,7 @@ export interface Observation {
     publicPicks: string[];
     removedCount: number;
     placed: boolean;
-    /** 亮出的那名（排完位才有）。 */
+    /** 亮出的那名（布完阵才有）。 */
     revealed: { pos: number; characterId: string } | null;
     /** 空出来的位置（被饕餮吞掉）是公开的。 */
     emptyPositions: number[];
@@ -161,8 +161,17 @@ export function legalActions(t: Table, seat: Seat): Action[] {
       return out;
     }
     case "peek": {
-      const foe = h.placement[other(seat)]!;
-      return foe.slots.flatMap((c, pos) => (c !== null && pos !== foe.reveal ? [{ type: "peek", pos } as Action] : []));
+      if (!h.peek[seat]) {
+        const foe = h.placement[other(seat)]!;
+        return foe.slots.flatMap((c, pos) => (c !== null && pos !== foe.reveal ? [{ type: "peek", pos } as Action] : []));
+      }
+      const mine = h.placement[seat]!;
+      const hidden = [0, 1, 2].filter((p) => mine.slots[p] !== null && p !== mine.reveal);
+      const out: Action[] = [{ type: "peekSwap", swap: null }];
+      for (let i = 0; i < hidden.length; i++) {
+        for (let j = i + 1; j < hidden.length; j++) out.push({ type: "peekSwap", swap: [hidden[i], hidden[j]] });
+      }
+      return out;
     }
     case "bet": {
       const out: Action[] = [];

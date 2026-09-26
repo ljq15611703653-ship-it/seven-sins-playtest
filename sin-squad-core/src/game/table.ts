@@ -10,7 +10,7 @@ import type { Action, Phase } from "./actions.js";
  *
  * 一手的顺序：
  *   底注 → 翻 2 张场地，筹码少的一方选 1 张 → 从各自牌池发 4 张
- *   → 非庄家排位并亮 1 名 → 庄家排位并亮 1 名 →（窥视者偷看）
+ *   → 非庄家布阵并亮 1 名 → 庄家布阵并亮 1 名 →（窥视者偷看）
  *   → 第 1 轮下注 →（操作：拿装备）→ 翻胜利规则 + 1 张公共效果 → 表决 /（暗标）
  *   → 第 2 轮下注 →（操作）→ 揭队战斗 → 结算 → 输家先挑人进牌池 → 各自可移除 1 名。
  */
@@ -24,6 +24,24 @@ export interface TableOptions {
   initialPoolSize?: number;
   minPoolSize?: number;
   minBet?: number;
+  /** 调试用：固定发牌、规则、场地等，方便测试某张牌。不影响正常游戏。 */
+  rig?: TableRig;
+}
+
+/**
+ * 调试用的固定项。没给的项照常随机；给了的项每一手都生效。
+ * 随机数照常消耗，所以同一个种子下，没固定的部分和不开调试时一样。
+ */
+export interface TableRig {
+  /** 每手固定发给某一方的人物（最多 4 名，不够的从牌池随机补）；不需要在牌池里。 */
+  deal?: [string[] | null, string[] | null];
+  ruleId?: string;
+  publicEffectId?: string;
+  arenaOptions?: [string, string];
+  /** 第一手的庄家。 */
+  dealer?: Seat;
+  /** 每手市场翻出的人物。 */
+  market?: string[];
 }
 
 export interface Placement {
@@ -93,7 +111,6 @@ export type TableEvent =
   | { type: "handStart"; no: number; dealer: Seat; ante: number; arenaOptions: [string, string]; chooser: Seat }
   | { type: "arenaChosen"; seat: Seat; arenaId: string }
   | { type: "placed"; seat: Seat; revealPos: number; characterId: string; eaten: number | null }
-  | { type: "peeked"; seat: Seat }
   | { type: "betAction"; seat: Seat; round: 1 | 2; action: string; amount: number; stack: number; pot: number }
   | { type: "refund"; seat: Seat; amount: number }
   | { type: "operate"; round: 1 | 2; fee: number; drafted: [boolean, boolean] }
@@ -115,7 +132,8 @@ const PEEKER_ID = "EN1"; // 窥视者
 const CROWN_ID = "PR3"; // 冠冕者
 
 export class Table {
-  readonly options: Required<TableOptions>;
+  readonly options: Required<Omit<TableOptions, "rig">>;
+  readonly rig: TableRig;
   rng: Rng;
   stacks: [number, number];
   pools: [string[], string[]];
@@ -139,12 +157,15 @@ export class Table {
       minPoolSize: options.minPoolSize ?? 6,
       minBet: options.minBet ?? 5,
     };
+    this.rig = options.rig ?? {};
+    checkRig(this.rig);
     this.rng = new Rng(this.options.seed);
     this.stacks = [this.options.buyIn, this.options.buyIn];
     this.total = this.options.buyIn * 2;
     const ids = CHARACTERS.map((c) => c.id);
     this.pools = [this.rng.sample(ids, this.options.initialPoolSize), this.rng.sample(ids, this.options.initialPoolSize)];
-    this.startHand(this.rng.int(2) as Seat);
+    const dealer = this.rng.int(2) as Seat;
+    this.startHand(this.rig.dealer ?? dealer);
   }
 
   // ───────────────────────── 查询 ─────────────────────────
@@ -186,14 +207,14 @@ export class Table {
     this.handNo++;
     const level = Math.floor((this.handNo - 1) / this.options.blindEvery);
     const ante = this.options.baseAnte * 2 ** level;
-    const arenaOptions = this.rng.sample(ARENAS.map((a) => a.id), 2) as [string, string];
+    const arenaOptions = pickOr(this.rng.sample(ARENAS.map((a) => a.id), 2) as [string, string], this.rig.arenaOptions);
     const chooser: Seat =
       this.stacks[0] === this.stacks[1] ? other(dealer) : this.stacks[0] < this.stacks[1] ? 0 : 1;
     this.hand = {
       no: this.handNo, dealer, ante,
       arenaOptions, arenaChooser: chooser, arenaId: null,
-      ruleId: this.rng.pick(RULES).id,
-      publicEffectId: this.rng.pick(PUBLIC_EFFECTS).id,
+      ruleId: pickOr(this.rng.pick(RULES).id, this.rig.ruleId),
+      publicEffectId: pickOr(this.rng.pick(PUBLIC_EFFECTS).id, this.rig.publicEffectId),
       ruleRevealed: false, peRevealed: false, peActive: false,
       dealt: [[], []], placing: null, placement: [null, null],
       equipment: [[null, null, null], [null, null, null]],
@@ -231,6 +252,7 @@ export class Table {
       case "chooseArena": return this.onArena(seat, action.index);
       case "place": return this.onPlace(seat, action.picks, action.eat, action.reveal);
       case "peek": return this.onPeek(seat, action.pos);
+      case "peekSwap": return this.onPeekSwap(seat, action.swap);
       case "check": case "bet": case "call": case "raise": case "allIn": case "fold":
         return this.onBet(seat, action);
       case "operate": return this.onOperate(seat, action.draft);
@@ -255,6 +277,11 @@ export class Table {
     for (const s of SEATS) {
       const idx = this.rng.sample([...this.pools[s].keys()], 4);
       h.dealt[s] = idx.map((i) => this.pools[s][i]);
+      const forced = this.rig.deal?.[s];
+      if (forced?.length) {
+        const rest = h.dealt[s].filter((id) => !forced.includes(id));
+        h.dealt[s] = [...forced, ...rest].slice(0, 4);
+      }
     }
     h.placing = other(h.dealer);
     this.phase = "place";
@@ -290,9 +317,33 @@ export class Table {
     if (!Number.isInteger(pos) || pos < 0 || pos > 2 || foe.slots[pos] === null || pos === foe.reveal) {
       throw new Error("只能查看对手一个暗置的位置");
     }
+    if (h.peek[seat]) throw new Error("已经偷看过了");
+    // 暗中进行：不写进公开的牌桌记录
     h.peek[seat] = { pos, characterId: foe.slots[pos]! };
+  }
+
+  /** 偷看之后，可以交换自己两名暗置人物的位置（亮出的那名和空位不能动）。同样暗中进行。 */
+  private onPeekSwap(seat: Seat, swap: [number, number] | null) {
+    this.expect("peek");
+    const h = this.hand;
+    if (!h.peek[seat]) throw new Error("先偷看，再决定要不要换位");
+    const pl = h.placement[seat]!;
+    if (swap) {
+      const [a, b] = swap;
+      const movable = (p: number) => Number.isInteger(p) && p >= 0 && p <= 2 && pl.slots[p] !== null && p !== pl.reveal;
+      if (a === b || !movable(a) || !movable(b)) throw new Error("只能交换自己两名暗置人物的位置");
+      [pl.slots[a], pl.slots[b]] = [pl.slots[b], pl.slots[a]];
+      if (pl.eat) {
+        if (pl.eat.eater === a) pl.eat = { ...pl.eat, eater: b };
+        else if (pl.eat.eater === b) pl.eat = { ...pl.eat, eater: a };
+      }
+      // 对手要是也偷看过被换走的人，他看到的跟着这名人物走
+      const theirs = h.peek[other(seat)];
+      if (theirs && (theirs.pos === a || theirs.pos === b)) {
+        h.peek[other(seat)] = { ...theirs, pos: pl.slots.indexOf(theirs.characterId) };
+      }
+    }
     h.peekPending[seat] = false;
-    this.log.push({ type: "peeked", seat });
     if (!h.peekPending[0] && !h.peekPending[1]) this.afterPlacement();
   }
 
@@ -546,6 +597,7 @@ export class Table {
         checkCount: h.stats[seat].checks,
         opsPaid: h.stats[seat].opsPaid,
         revealedPos: p.reveal,
+        stack: this.stacks[seat],
       },
     };
   }
@@ -572,6 +624,7 @@ export class Table {
       arenaId: h.arenaId!,
       publicEffectId: h.peActive ? h.publicEffectId : null,
       pot: h.pot,
+      firstSeat: other(h.dealer), // 非庄家先手：庄家后布阵、有信息优势
     });
     h.battle = result;
     this.log.push({
@@ -588,6 +641,7 @@ export class Table {
     h.outcome = { winner: result.winner, by: "battle", pot };
     this.log.push({ type: "settle", winner: result.winner, pot, stacks: [this.stacks[0], this.stacks[1]] });
     this.checkInvariant();
+    if (this.endIfBroke()) return;
     this.openMarket(result.winner === null ? other(h.dealer) : other(result.winner));
   }
 
@@ -600,7 +654,17 @@ export class Table {
     h.outcome = { winner, by: "fold", pot };
     this.log.push({ type: "settle", winner, pot, stacks: [this.stacks[0], this.stacks[1]] });
     this.checkInvariant();
+    if (this.endIfBroke()) return;
     this.openMarket(folder);
+  }
+
+  /** 结算后有人筹码归零：牌桌当场结束，不再进市场。 */
+  private endIfBroke(): boolean {
+    if (this.stacks[0] > 0 && this.stacks[1] > 0) return false;
+    this.winner = this.stacks[0] === 0 ? 1 : 0;
+    this.phase = "over";
+    this.log.push({ type: "tableOver", winner: this.winner });
+    return true;
   }
 
   // ───────────────────────── 市场 ─────────────────────────
@@ -610,7 +674,7 @@ export class Table {
     const stage = Table.marketStageFor(this.handNo, this.options.blindEvery);
     let ids = CHARACTERS.filter((c) => c.stage === stage).map((c) => c.id);
     if (ids.length < 3) ids = CHARACTERS.filter((c) => c.stage === 2).map((c) => c.id); // 罪王级还没设计
-    h.market = this.rng.sample(ids, 3);
+    h.market = pickOr(this.rng.sample(ids, 3), this.rig.market?.slice(0, 3));
     h.marketOrder = [firstPicker, other(firstPicker)];
     h.marketStep = 0;
     h.removeDone = [false, false];
@@ -646,17 +710,28 @@ export class Table {
     h.removeDone[seat] = true;
     this.log.push({ type: "marketRemove", seat, removed: poolIndex !== null });
     if (!h.removeDone[0] || !h.removeDone[1]) return;
-    if (this.stacks[0] === 0 || this.stacks[1] === 0) {
-      this.winner = this.stacks[0] === 0 ? 1 : 0;
-      this.phase = "over";
-      this.log.push({ type: "tableOver", winner: this.winner });
-      return;
-    }
     this.startHand(other(h.dealer));
   }
 }
 
-/** 检查排位是否合法，返回排好的阵容。 */
+/** 调试固定项：给了就用给的，没给就用随机结果（随机数照常消耗）。 */
+function pickOr<T>(random: T, fixed: T | undefined): T {
+  return fixed ?? random;
+}
+
+/** 调试固定项里的编号必须存在，写错了立刻报错。 */
+function checkRig(rig: TableRig) {
+  for (const list of rig.deal ?? []) {
+    if (list && list.length > 4) throw new Error("每手最多固定发 4 名");
+    for (const id of list ?? []) character(id);
+  }
+  for (const id of rig.market ?? []) character(id);
+  if (rig.ruleId && !RULES.some((r) => r.id === rig.ruleId)) throw new Error(`未知胜利规则：${rig.ruleId}`);
+  if (rig.publicEffectId && !PUBLIC_EFFECTS.some((p) => p.id === rig.publicEffectId)) throw new Error(`未知公共效果：${rig.publicEffectId}`);
+  for (const id of rig.arenaOptions ?? []) if (!ARENAS.some((a) => a.id === id)) throw new Error(`未知场地：${id}`);
+}
+
+/** 检查布阵是否合法，返回布好的阵容。 */
 export function validatePlacement(dealt: string[], picks: number[], eat: EatChoice | null, reveal: number): Placement {
   if (!Array.isArray(picks) || picks.length !== 3) throw new Error("要挑 3 名排到 1、2、3 号位");
   if (new Set(picks).size !== 3 || picks.some((i) => !Number.isInteger(i) || i < 0 || i >= dealt.length)) {

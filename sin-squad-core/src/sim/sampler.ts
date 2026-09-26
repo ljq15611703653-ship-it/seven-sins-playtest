@@ -12,6 +12,7 @@ export function randomBet(rng: Rng, revealedPos: number): BetContext {
     checkCount: rng.pick([0, 1, 1, 2]),
     opsPaid: rng.pick([0, 1, 1, 2]),
     revealedPos,
+    stack: rng.pick([30, 60, 90, 120]),
   };
 }
 
@@ -54,6 +55,7 @@ export function randomBattle(rng: Rng, fixedA?: string[], arenaId?: string): Ran
       arenaId: arenaId ?? rng.pick(ARENAS).id,
       publicEffectId: rng.next() < 0.5 ? rng.pick(PUBLIC_EFFECTS).id : null,
       pot: a.bet.invested + b.bet.invested,
+      firstSeat: rng.int(2) as 0 | 1,
     },
     ids: [a.slots.map((s) => s.characterId!), b.slots.map((s) => s.characterId!)],
   };

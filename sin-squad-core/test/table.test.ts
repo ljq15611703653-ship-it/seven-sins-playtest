@@ -108,21 +108,65 @@ describe("下注与操作费", () => {
   });
 
   it("冠冕者被亮出时，对手第 1 轮不能弃牌", () => {
-    for (let seed = 1; seed < 400; seed++) {
-      const t = new Table({ seed });
-      driveUntil(t, "place");
-      const placer = t.toAct()[0];
-      const crownIdx = t.hand.dealt[placer].indexOf("PR3");
-      if (crownIdx < 0) continue;
-      const rest = [0, 1, 2, 3].filter((i) => i !== crownIdx).slice(0, 2);
-      t.apply(placer, { type: "place", picks: [crownIdx, rest[0], rest[1]], eat: null, reveal: 0 });
-      driveUntil(t, "bet");
-      const foe: Seat = placer === 0 ? 1 : 0;
-      expect(t.canFold(foe)).toBe(false);
-      expect(legalActions(t, foe).some((a) => a.type === "fold")).toBe(false);
-      return;
-    }
-    throw new Error("没有找到发到冠冕者的种子");
+    const t = new Table({ seed: 1, rig: { dealer: 1, deal: [["PR3"], null] } }); // 你（座位 0）先布阵
+    driveUntil(t, "place");
+    t.apply(0, { type: "place", picks: [0, 1, 2], eat: null, reveal: 0 }); // 冠冕者在 1 号位亮出
+    driveUntil(t, "bet");
+    expect(t.canFold(1)).toBe(false);
+    expect(legalActions(t, 1).some((a) => a.type === "fold")).toBe(false);
+  });
+});
+
+describe("窥视者", () => {
+  /** 固定发牌：座位 0 先布阵，把窥视者暗置在 2 号位；对手没有窥视者。 */
+  function toPeek() {
+    const t = new Table({ seed: 3, rig: { dealer: 1, deal: [["WR3", "EN1", "GR2", "SL1"], ["LU1", "GR3", "PR1", "WR2"]] } });
+    driveUntil(t, "place");
+    t.apply(0, { type: "place", picks: [0, 1, 2], eat: null, reveal: 0 });
+    t.apply(1, { type: "place", picks: [0, 1, 2], eat: null, reveal: 0 });
+    expect(t.phase).toBe("peek");
+    expect(t.toAct()).toEqual([0]);
+    return { t, seat: 0 as Seat };
+  }
+
+  it("偷看是暗中进行的：不写进公开的牌桌记录", () => {
+    const { t, seat } = toPeek();
+    const before = t.log.length;
+    t.apply(seat, { type: "peek", pos: 1 });
+    expect(t.log.length).toBe(before);
+    expect(observe(t, seat).me.peek?.pos).toBe(1);
+    expect(observe(t, seat === 0 ? 1 : 0).me.peek).toBeNull();
+  });
+
+  it("偷看后可以交换自己两名暗置人物；亮出的那名不能动", () => {
+    const { t, seat } = toPeek();
+    t.apply(seat, { type: "peek", pos: 2 });
+    const slots = t.hand.placement[seat]!.slots.slice();
+    expect(() => t.apply(seat, { type: "peekSwap", swap: [0, 1] })).toThrow(); // 0 号位是亮出的
+    expect(legalActions(t, seat)).toContainEqual({ type: "peekSwap", swap: [1, 2] });
+    t.apply(seat, { type: "peekSwap", swap: [1, 2] });
+    expect(t.hand.placement[seat]!.slots).toEqual([slots[0], slots[2], slots[1]]);
+    expect(t.phase).toBe("bet");
+  });
+});
+
+describe("调试固定项", () => {
+  it("固定发牌、规则、公共效果、场地、庄家；没固定的照常随机", () => {
+    const rig = { deal: [["EN1", "GL2"], null] as [string[], null], ruleId: "V02", publicEffectId: "P10", arenaOptions: ["A08", "A02"] as [string, string], dealer: 0 as Seat };
+    const t = new Table({ seed: 9, rig });
+    expect(t.hand.dealer).toBe(0);
+    expect(t.hand.arenaOptions).toEqual(["A08", "A02"]);
+    expect(t.hand.ruleId).toBe("V02");
+    expect(t.hand.publicEffectId).toBe("P10");
+    driveUntil(t, "place");
+    expect(t.hand.dealt[0].slice(0, 2)).toEqual(["EN1", "GL2"]);
+    expect(t.hand.dealt[0]).toHaveLength(4);
+    expect(new Table({ seed: 9 }).pools).toEqual(t.pools); // 随机数照常消耗
+  });
+
+  it("编号写错会立刻报错", () => {
+    expect(() => new Table({ rig: { deal: [["XX9"], null] } })).toThrow();
+    expect(() => new Table({ rig: { ruleId: "V99" } })).toThrow();
   });
 });
 
@@ -211,5 +255,48 @@ describe("牌桌层", () => {
     expect(t.pools[seat].length).toBe(7);
     expect(() => t.apply(seat, { type: "marketRemove", poolIndex: 0 })).toThrow();
     expect(legalActions(t, seat)).toEqual([{ type: "marketRemove", poolIndex: null }]);
+  });
+});
+
+describe("存档重放", () => {
+  it("同一个种子照着记录的动作重放，回到一模一样的局面", () => {
+    const seed = 2024;
+    const t = new Table({ seed });
+    const agents = [new HeuristicAgent("aggressive", 1), new HeuristicAgent("bluff", 2)];
+    const record: Array<[Seat, Action]> = [];
+    for (let i = 0; i < 400 && t.phase !== "over"; i++) {
+      const seat = t.toAct()[0];
+      const a = agents[seat].act(t, seat);
+      t.apply(seat, a);
+      record.push([seat, JSON.parse(JSON.stringify(a))]); // 和存进浏览器一样走一遍 JSON
+    }
+    const r = new Table({ seed });
+    for (const [seat, a] of record) r.apply(seat, a);
+    expect(r.handNo).toBe(t.handNo);
+    expect(r.phase).toBe(t.phase);
+    expect(r.stacks).toEqual(t.stacks);
+    expect(r.log).toEqual(t.log);
+    expect(observe(r, 0)).toEqual(observe(t, 0));
+  });
+});
+
+describe("牌桌结束", () => {
+  it("有人筹码输光，结算后立刻结束，不再进市场", () => {
+    for (let seed = 1; seed <= 30; seed++) {
+      const t = new Table({ seed });
+      const agents = [new HeuristicAgent("aggressive", seed), new HeuristicAgent("aggressive", seed + 100)];
+      for (let i = 0; i < 2000 && t.phase !== "over"; i++) {
+        const seat = t.toAct()[0];
+        t.apply(seat, agents[seat].act(t, seat));
+        if (t.phase === "marketPick" || t.phase === "marketRemove") {
+          expect(t.stacks[0]).toBeGreaterThan(0);
+          expect(t.stacks[1]).toBeGreaterThan(0);
+        }
+      }
+      expect(t.phase).toBe("over");
+      expect(t.stacks[t.winner!]).toBe(200);
+      const last = t.log.slice(-2).map((e) => e.type);
+      expect(last).toEqual(["settle", "tableOver"]);
+    }
   });
 });

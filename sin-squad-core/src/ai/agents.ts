@@ -46,7 +46,7 @@ export class HeuristicAgent implements Agent {
     switch (obs.phase) {
       case "arena": return this.rng.pick(acts);
       case "place": return this.choosePlacement(obs, acts);
-      case "peek": return this.rng.pick(acts);
+      case "peek": return acts[0].type === "peek" ? this.rng.pick(acts) : this.chooseSwap(obs, acts);
       case "bet": return this.chooseBet(obs, acts);
       case "operate": return { type: "operate", draft: obs.opFee <= Math.max(10, obs.stacks[seat] * 0.25) };
       case "draft": return this.chooseDraft(obs, acts);
@@ -73,7 +73,7 @@ export class HeuristicAgent implements Agent {
         : this.rng.next() < 0.3 ? this.rng.pick(PUBLIC_EFFECTS).id : null;
       const arenaId = obs.arenaId ?? obs.arenaOptions[0];
       const teams: [TeamSetup, TeamSetup] = obs.seat === 0 ? [me, foe] : [foe, me];
-      const r = runBattle({ teams, ruleId, arenaId, publicEffectId: peId, pot: obs.pot });
+      const r = runBattle({ teams, ruleId, arenaId, publicEffectId: peId, pot: obs.pot, firstSeat: other(obs.dealer) });
       score += r.winner === obs.seat ? 1 : r.winner === null ? 0.5 : 0;
     }
     return score / n;
@@ -82,7 +82,9 @@ export class HeuristicAgent implements Agent {
   private myTeam(obs: Observation): TeamSetup | null {
     const p = obs.me.placement;
     if (!p) return null;
-    const slots: SlotSetup[] = p.slots.map((c, i) => ({ characterId: c, equipmentId: c ? obs.me.equipment[i] : null }));
+    const slots: SlotSetup[] = p.slots.map((c, i) => ({
+      characterId: c, equipmentId: c ? obs.me.equipment[i] : null, effectId: c ? obs.me.slotEffects[i] : null,
+    }));
     return { slots, eat: null, bet: this.betCtx(obs, obs.seat, p.reveal) };
   }
 
@@ -93,6 +95,7 @@ export class HeuristicAgent implements Agent {
       checkCount: obs.betting.checkCount[seat],
       opsPaid: obs.betting.opsPaid[seat],
       revealedPos,
+      stack: obs.stacks[seat],
     };
   }
 
@@ -105,7 +108,7 @@ export class HeuristicAgent implements Agent {
       if (o.revealed && o.revealed.pos === pos) id = o.revealed.characterId;
       else if (obs.me.peek && obs.me.peek.pos === pos) id = obs.me.peek.characterId;
       else id = this.rng.pick(pool);
-      return { characterId: id, equipmentId: o.equipment[pos] };
+      return { characterId: id, equipmentId: o.equipment[pos], effectId: o.slotEffects[pos] };
     });
     return { slots, eat: null, bet: this.betCtx(obs, other(obs.seat), o.revealed?.pos ?? 0) };
   }
@@ -148,6 +151,24 @@ export class HeuristicAgent implements Agent {
     return has("fold") ?? has("call") ?? acts[0];
   }
 
+  /** 偷看之后：试每一种换位（包括不换），挑估算胜率最高的。 */
+  private chooseSwap(obs: Observation, acts: Action[]): Action {
+    const base = this.myTeam(obs)!;
+    let best = acts[0];
+    let bestScore = -1;
+    for (const a of acts) {
+      if (a.type !== "peekSwap") continue;
+      const team: TeamSetup = { ...base, slots: base.slots.map((s) => ({ ...s })) };
+      if (a.swap) {
+        const [x, y] = a.swap;
+        [team.slots[x], team.slots[y]] = [team.slots[y], team.slots[x]];
+      }
+      const s = this.estimate(obs, team, {}, 8);
+      if (s > bestScore) { bestScore = s; best = a; }
+    }
+    return best;
+  }
+
   private chooseDraft(obs: Observation, acts: Action[]): Action {
     const base = this.myTeam(obs)!;
     let best = acts[0];
@@ -155,7 +176,10 @@ export class HeuristicAgent implements Agent {
     for (const a of acts) {
       if (a.type !== "draft") continue;
       const team: TeamSetup = { ...base, slots: base.slots.map((s) => ({ ...s })) };
-      team.slots[a.pos].equipmentId = obs.me.offers![a.offerIndex];
+      const id = obs.me.offers![a.offerIndex];
+      // 效果槽牌装进效果槽，不顶掉已经装着的装备
+      if (id.startsWith("FX")) team.slots[a.pos].effectId = id;
+      else team.slots[a.pos].equipmentId = id;
       const s = this.estimate(obs, team, {}, 4);
       if (s > bestScore) { bestScore = s; best = a; }
     }

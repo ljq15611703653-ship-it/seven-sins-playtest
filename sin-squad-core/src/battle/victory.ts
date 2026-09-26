@@ -6,7 +6,8 @@ import { health, type Unit } from "./unit.js";
  *
  * “保持 N 轮”的含义：条件成立的那一轮算起，再保持 N 轮，
  * 也就是需要连续 N+1 个轮末都成立。
- * 所以“保持 1 轮”= 连续 2 个轮末，“连续保持 2 轮”= 连续 3 个轮末。
+ * 所以“保持 1 轮”= 连续 2 个轮末；“轮末时成立即胜”= 1 个轮末就够。
+ * 不需要“保持”的规则（击倒类、关键人物）在每次攻击后都会检查，达成就立刻结束。
  */
 
 export interface KeyUnits {
@@ -58,37 +59,49 @@ export function setupVictory(ruleId: string, teams: [Unit[], Unit[]], revealedPo
 
 const dead = (u: Unit | null) => !!u && !u.alive;
 
-/** 本轮结束时，双方各自是否达成胜利条件。 */
+/** 随时成立就立刻获胜的条件（每次攻击后都检查）：全灭，以及不需要“保持”的规则。 */
+export function instantClaims(st: VictoryState, teams: [Unit[], Unit[]]): [boolean, boolean] {
+  return [instantFor(st, teams, 0), instantFor(st, teams, 1)];
+}
+
+function instantFor(st: VictoryState, teams: [Unit[], Unit[]], seat: Seat): boolean {
+  const foe = teams[other(seat)];
+  if (existing(foe).length > 0 && alive(foe).length === 0) return true; // 全灭永远有效
+  return condition(st, teams, seat);
+}
+
+function condition(st: VictoryState, teams: [Unit[], Unit[]], seat: Seat): boolean {
+  const me = teams[seat];
+  const foe = teams[other(seat)];
+  const foeKeys = st.keys[other(seat)];
+  switch (st.ruleId) {
+    case "V02": return deaths(foe) >= 1;
+    case "V03": return deaths(foe) >= 2;
+    case "V04": return alive(me).length >= 2 && alive(foe).length === 1;
+    case "V05": return existing(foe).every((u) => health(u) <= 0.5);
+    case "V06": return existing(foe).filter((u) => health(u) <= 0.25).length >= 2;
+    case "V07": return dead(foeKeys.flag);
+    case "V08": return dead(foeKeys.core);
+    case "V09": return dead(foeKeys.weak);
+    case "V10": return dead(foeKeys.flag) && dead(foeKeys.secondCore);
+    case "V11": return dead(foeKeys.flag) && deaths(foe) >= 2;
+    case "V12": return dead(foeKeys.revealed);
+    case "V17": return deaths(foe) >= 1 && existing(me).every((u) => u.alive && health(u) > 0.5);
+    case "V20": return deaths(foe) >= 2;
+    default: return false;
+  }
+}
+
+/** 一轮结束时，双方各自是否达成胜利条件（包括需要连续保持的规则）。 */
 export function roundEndClaims(st: VictoryState, teams: [Unit[], Unit[]], round: number): [boolean, boolean] {
-  const claims: [boolean, boolean] = [false, false];
-  const condition = (seat: Seat): boolean => {
-    const me = teams[seat];
-    const foe = teams[other(seat)];
-    const foeKeys = st.keys[other(seat)];
-    switch (st.ruleId) {
-      case "V02": return deaths(foe) >= 1;
-      case "V03": return deaths(foe) >= 2;
-      case "V04": return alive(me).length >= 2 && alive(foe).length === 1;
-      case "V05": return existing(foe).every((u) => health(u) <= 0.5);
-      case "V06": return existing(foe).filter((u) => health(u) <= 0.25).length >= 2;
-      case "V07": return dead(foeKeys.flag);
-      case "V08": return dead(foeKeys.core);
-      case "V09": return dead(foeKeys.weak);
-      case "V10": return dead(foeKeys.flag) && dead(foeKeys.secondCore);
-      case "V11": return dead(foeKeys.flag) && deaths(foe) >= 2;
-      case "V12": return dead(foeKeys.revealed);
-      case "V17": return deaths(foe) >= 1 && existing(me).every((u) => u.alive && health(u) > 0.5);
-      case "V20": return deaths(foe) >= 2;
-      default: return false;
-    }
-  };
+  const claims = instantClaims(st, teams);
 
   // 维持压制：连续轮末计数
   const streakCondition = (seat: Seat): boolean | null => {
     const me = teams[seat];
     const foe = teams[other(seat)];
     switch (st.ruleId) {
-      case "V13": return round >= 2 && teamHealth(me) - teamHealth(foe) >= 0.75;
+      case "V13": return teamHealth(me) - teamHealth(foe) >= 0.75;
       case "V14": return alive(me).length > alive(foe).length;
       case "V15": {
         const mine = st.keys[seat].flag;
@@ -99,12 +112,9 @@ export function roundEndClaims(st: VictoryState, teams: [Unit[], Unit[]], round:
       default: return null;
     }
   };
-  const need = st.ruleId === "V13" || st.ruleId === "V14" ? 3 : 2;
+  const need = st.ruleId === "V13" || st.ruleId === "V14" ? 2 : 1;
 
   for (const seat of [0, 1] as Seat[]) {
-    const foe = teams[other(seat)];
-    if (existing(foe).length > 0 && alive(foe).length === 0) claims[seat] = true; // 全灭永远有效
-    if (condition(seat)) claims[seat] = true;
     const sc = streakCondition(seat);
     if (sc !== null) {
       st.streak[seat] = sc ? st.streak[seat] + 1 : 0;
@@ -135,7 +145,7 @@ function applyBreakoutWindow(st: VictoryState, teams: [Unit[], Unit[]], round: n
     st.window = null; // 孤身者反杀成功，继续打
     return;
   }
-  if (round - openedAt >= 2) {
+  if (round - openedAt >= 1) {
     const many = alive(teams[other(lone)]).length > alive(teams[lone]).length ? other(lone) : null;
     if (many !== null) claims[many] = true;
     st.window = null;
